@@ -19,6 +19,7 @@
 import sys
 import urllib
 import cgi
+import re
 try: import simplejson as json
 except ImportError: import json
 
@@ -222,7 +223,7 @@ class YouTubePlayer():
         return video_url
 
     def userSelectsVideoQuality(self, params, links):
-        levels =    [([37,121], u"1080p"),
+        levels =    [([37,121,137], u"1080p"),
                      ([22,45,120], u"720p"),
                      ([35,44], u"480p"),
                      ([18], u"380p"),
@@ -327,9 +328,14 @@ class YouTubePlayer():
         self.common.log(u"flashvars: " + repr(flashvars), 2)
         return flashvars
 
+    def extractJSPlayer(self, data):
+        return 'http:' + re.search('"assets":.+?"js":\s*("[^"]+")', data).group(1).replace('\\', '').replace('"', '')
+
     def scrapeWebPageForVideoLinks(self, result, video):
         self.common.log(u"")
         links = {}
+        
+        jsPlayer = self.extractJSPlayer(result[u"content"])
 
         flashvars = self.extractFlashVars(result[u"content"])
         if not flashvars.has_key(u"url_encoded_fmt_stream_map"):
@@ -341,7 +347,7 @@ class YouTubePlayer():
         if flashvars.has_key(u"hlsvp"):                               
             video[u"hlsvp"] = flashvars[u"hlsvp"]    
 
-        for url_desc in flashvars[u"url_encoded_fmt_stream_map"].split(u","):
+        for url_desc in flashvars[u"url_encoded_fmt_stream_map"].split(u",") + flashvars[u"adaptive_fmts"].split(u","):
             url_desc_map = cgi.parse_qs(url_desc)
             self.common.log(u"url_map: " + repr(url_desc_map), 2)
             if not (url_desc_map.has_key(u"url") or url_desc_map.has_key(u"stream")):
@@ -363,46 +369,132 @@ class YouTubePlayer():
                 url = url + u"&signature=" + url_desc_map[u"sig"][0]
             elif url_desc_map.has_key(u"s"):
                 sig = url_desc_map[u"s"][0]
-                url = url + u"&signature=" + self.decrypt_signature(sig)
+                url = url + u"&signature=" + self.decrypt_signature(jsPlayer, sig)
 
+            if url.find(u"&ratebypass=") == -1:
+                url = url + u"&ratebypass=yes"
+            
             links[key] = url
 
         return links
 
-    def decrypt_signature(self, s):
-        ''' use decryption solution by Youtube-DL project '''
-        if len(s) == 93:
-            return s[86:29:-1] + s[88] + s[28:5:-1]
-        elif len(s) == 92:
-            return s[25] + s[3:25] + s[0] + s[26:42] + s[79] + s[43:79] + s[91] + s[80:83]
-        elif len(s) == 91:
-            return s[84:27:-1] + s[86] + s[26:5:-1]
-        elif len(s) == 90:
-            return s[25] + s[3:25] + s[2] + s[26:40] + s[77] + s[41:77] + s[89] + s[78:81]
-        elif len(s) == 89:
-            return s[84:78:-1] + s[87] + s[77:60:-1] + s[0] + s[59:3:-1]
-        elif len(s) == 88:
-            return s[7:28] + s[87] + s[29:45] + s[55] + s[46:55] + s[2] + s[56:87] + s[28]
-        elif len(s) == 87:
-            return s[6:27] + s[4] + s[28:39] + s[27] + s[40:59] + s[2] + s[60:]
-        elif len(s) == 86:
-            return s[5:34] + s[0] + s[35:38] + s[3] + s[39:45] + s[38] + s[46:53] + s[73] + s[54:73] + s[85] + s[74:85] + s[53]
-        elif len(s) == 85:
-            return s[3:11] + s[0] + s[12:55] + s[84] + s[56:84]
-        elif len(s) == 84:
-            return s[81:36:-1] + s[0] + s[35:2:-1]
-        elif len(s) == 83:
-            return s[81:64:-1] + s[82] + s[63:52:-1] + s[45] + s[51:45:-1] + s[1] + s[44:1:-1] + s[0]
-        elif len(s) == 82:
-            return s[80:73:-1] + s[81] + s[72:54:-1] + s[2] + s[53:43:-1] + s[0] + s[42:2:-1] + s[43] + s[1] + s[54]
-        elif len(s) == 81:
-            return s[56] + s[79:56:-1] + s[41] + s[55:41:-1] + s[80] + s[40:34:-1] + s[0] + s[33:29:-1] + s[34] + s[28:9:-1] + s[29] + s[8:0:-1] + s[9]
-        elif len(s) == 80:
-            return s[1:19] + s[0] + s[20:68] + s[19] + s[69:80]
-        elif len(s) == 79:
-            return s[54] + s[77:54:-1] + s[39] + s[53:39:-1] + s[78] + s[38:34:-1] + s[0] + s[33:29:-1] + s[34] + s[28:9:-1] + s[29] + s[8:0:-1] + s[9]
-        else:
-            self.common.log(u'Unable to decrypt signature, key length %d not supported; retrying might work' % (len(s)))
+    # see: http://userscripts.org/scripts/review/25105
+    # and: https://github.com/rg3/youtube-dl/blob/master/youtube_dl/extractor/youtube.py
+    def decrypt_signature(self, player_url, s):
+        ''' from Youtube-DL '''
+        code = self.core._fetchPage({"link": player_url})[u"content"]
+        decode_func = self._parse_sig_js(code)
+        return decode_func(s)
+
+    def _parse_sig_js(self, jscode):
+        funcname = re.search(r'signature=([a-zA-Z]+)', jscode).group(1)
+
+        functions = {}
+
+        def argidx(varname):
+            return string.lowercase.index(varname)
+
+        def interpret_statement(stmt, local_vars, allow_recursion=20):
+            if allow_recursion < 0:
+                raise ExtractorError(u'Recursion limit reached')
+
+            if stmt.startswith(u'var '):
+                stmt = stmt[len(u'var '):]
+            ass_m = re.match(r'^(?P<out>[a-z]+)(?:\[(?P<index>[^\]]+)\])?' +
+                             r'=(?P<expr>.*)$', stmt)
+            if ass_m:
+                if ass_m.groupdict().get('index'):
+                    def assign(val):
+                        lvar = local_vars[ass_m.group('out')]
+                        idx = interpret_expression(ass_m.group('index'),
+                                                   local_vars, allow_recursion)
+                        assert isinstance(idx, int)
+                        lvar[idx] = val
+                        return val
+                    expr = ass_m.group('expr')
+                else:
+                    def assign(val):
+                        local_vars[ass_m.group('out')] = val
+                        return val
+                    expr = ass_m.group('expr')
+            elif stmt.startswith(u'return '):
+                assign = lambda v: v
+                expr = stmt[len(u'return '):]
+            else:
+                raise ExtractorError(
+                    u'Cannot determine left side of statement in %r' % stmt)
+
+            v = interpret_expression(expr, local_vars, allow_recursion)
+            return assign(v)
+
+        def interpret_expression(expr, local_vars, allow_recursion):
+            if expr.isdigit():
+                return int(expr)
+
+            if expr.isalpha():
+                return local_vars[expr]
+
+            m = re.match(r'^(?P<in>[a-z]+)\.(?P<member>.*)$', expr)
+            if m:
+                member = m.group('member')
+                val = local_vars[m.group('in')]
+                if member == 'split("")':
+                    return list(val)
+                if member == 'join("")':
+                    return u''.join(val)
+                if member == 'length':
+                    return len(val)
+                if member == 'reverse()':
+                    return val[::-1]
+                slice_m = re.match(r'slice\((?P<idx>.*)\)', member)
+                if slice_m:
+                    idx = interpret_expression(
+                        slice_m.group('idx'), local_vars, allow_recursion-1)
+                    return val[idx:]
+
+            m = re.match(
+                r'^(?P<in>[a-z]+)\[(?P<idx>.+)\]$', expr)
+            if m:
+                val = local_vars[m.group('in')]
+                idx = interpret_expression(m.group('idx'), local_vars,
+                                           allow_recursion-1)
+                return val[idx]
+
+            m = re.match(r'^(?P<a>.+?)(?P<op>[%])(?P<b>.+?)$', expr)
+            if m:
+                a = interpret_expression(m.group('a'),
+                                         local_vars, allow_recursion)
+                b = interpret_expression(m.group('b'),
+                                         local_vars, allow_recursion)
+                return a % b
+
+            m = re.match(
+                r'^(?P<func>[a-zA-Z]+)\((?P<args>[a-z0-9,]+)\)$', expr)
+            if m:
+                fname = m.group('func')
+                if fname not in functions:
+                    functions[fname] = extract_function(fname)
+                argvals = [int(v) if v.isdigit() else local_vars[v]
+                           for v in m.group('args').split(',')]
+                return functions[fname](argvals)
+            raise ExtractorError(u'Unsupported JS expression %r' % expr)
+
+        def extract_function(funcname):
+            func_m = re.search(
+                r'function ' + re.escape(funcname) +
+                r'\((?P<args>[a-z,]+)\){(?P<code>[^}]+)}',
+                jscode)
+            argnames = func_m.group('args').split(',')
+
+            def resf(args):
+                local_vars = dict(zip(argnames, args))
+                for stmt in func_m.group('code').split(';'):
+                    res = interpret_statement(stmt, local_vars)
+                return res
+            return resf
+
+        initial_function = extract_function(funcname)
+        return lambda s: initial_function([s])
 
     def getVideoPageFromYoutube(self, get, has_verified = False):
         login = "false"
